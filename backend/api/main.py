@@ -1,8 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import kpi_router
-from routers import anomaly_router
-from routers import ai_router
+from ..routers import kpi_router
+from ..routers import anomaly_router
+from ..routers import ai_router
 
 app = FastAPI(title="Supply Chain Control Tower")
 
