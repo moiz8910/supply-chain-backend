@@ -1,109 +1,170 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+import sqlite3
+import json
+import os
+from typing import List, Dict
+
+# LangChain for AWS Bedrock
+from langchain_aws import ChatBedrockConverse
+from database import engine
+from sqlalchemy import text
 
 router = APIRouter(prefix="/api/anomaly", tags=["anomaly"])
 
 class ApproveRequest(BaseModel):
+    exception_id: str
     alternative_id: str
 
-@router.get("/current")
-def get_current_anomaly():
-    return {
-        "id": "AN-2026-001",
-        "title": "ISO Tanker Shortage Detected",
-        "description": "Critical shortage in ISO tanker availability detected due to an operational suspension at a major regional tank cleaning facility. Predicted to impact out-bound logistics for the next 14 days.",
-        "severity": "high",
-        "affected_products": [
-            "Ethyl acetate",
-            "Acetic anhydride",
-            "Acetaldehyde",
-            "Fuel-grade ethanol",
-            "Butyl Acetate"
-        ],
-        "impacted_orders_count": 42,
-        "estimated_value_at_risk": "$1.25M"
-    }
+class ExceptionStatusUpdate(BaseModel):
+    status: str
 
-@router.get("/impact")
-def get_anomaly_impact():
-    return [
-        {
-            "kpi": "OTIF",
-            "current": "92.4%",
-            "predicted": "81.0%",
-            "delta": "-11.4%",
-            "status": "critical"
-        },
-        {
-            "kpi": "Order Lead Time",
-            "current": "4.2 Days",
-            "predicted": "8.5 Days",
-            "delta": "+4.3 Days",
-            "status": "critical"
-        },
-        {
-            "kpi": "Freight Cost / Unit",
-            "current": "$12.50",
-            "predicted": "$14.80",
-            "delta": "+18.4%",
-            "status": "warning"
-        },
-        {
-             "kpi": "Inventory Turnover (FG)",
-             "current": "12.5",
-             "predicted": "11.2",
-             "delta": "-10.4%",
-             "status": "warning"
-        }
-    ]
+@router.get("/alternatives/{exception_id}")
+def get_alternatives(exception_id: str):
+    try:
+        # Check if we already have alternatives cached
+        with engine.connect() as conn:
+            res = conn.execute(
+                text("SELECT alt_id, title, description, cost_impact, kpi_impact, tradeoff FROM exception_alternatives WHERE exception_id = :eid"),
+                {"eid": exception_id}
+            )
+            rows = res.fetchall()
+            if rows:
+                alts = []
+                for row in rows:
+                    alts.append({
+                        "id": row._mapping["alt_id"],
+                        "title": row._mapping["title"],
+                        "description": row._mapping["description"],
+                        "cost_impact": row._mapping["cost_impact"],
+                        "kpi_impact": row._mapping["kpi_impact"],
+                        "tradeoff": row._mapping["tradeoff"]
+                    })
+                return alts
 
-@router.get("/alternatives")
-def get_alternatives():
-    return [
-        {
-            "id": "alt_1",
-            "title": "Pre-book / Secure Capacity",
-            "description": "Pay a premium to LSPs to secure guaranteed ISO tanker capacity immediately.",
-            "cost_impact": "+$120K (Premium)",
-            "kpi_impact": "Maintains OTIF at >90%, avoids Lead Time delays.",
-            "tradeoff": "High immediate cost, protects critical customer relationships."
-        },
-        {
-            "id": "alt_2",
-            "title": "Prioritize Critical Orders",
-            "description": "Allocate available tankers only to Tier 1 customers. Delay Tier 2/3.",
-            "cost_impact": "Minimal direct cost",
-            "kpi_impact": "Overall OTIF drops to 85%. SLA penalties estimated at $45K.",
-            "tradeoff": "Lowest upfront cost, but risks long-term satisfaction for non-critical accounts."
-        },
-        {
-            "id": "alt_3",
-            "title": "Re-route via Alternate Port",
-            "description": "Divert shipments to Port B where ISO tankers are generally more available.",
-            "cost_impact": "+$85K (Extra transit)",
-            "kpi_impact": "Adds 2 days to Lead Time. OTIF drops to 88%.",
-            "tradeoff": "Moderate cost, slight delays, highly dependent on Port B's actual real-time capacity."
-        },
-        {
-            "id": "alt_4",
-            "title": "Dispatch Earlier",
-            "description": "Push all available inventory out now before the shortage fully hits the market.",
-            "cost_impact": "+$60K (Storage at destination)",
-            "kpi_impact": "Maintains OTIF. Decreases Inventory Turnover temporarily.",
-            "tradeoff": "Requires immediate plant action and coordination with destination warehouses."
-        }
-    ]
+            # If not found, fetch the exception details to give to the LLM
+            ex_res = conn.execute(
+                text("SELECT root_cause_hypotheses, exception_type, severity_level, impacted_kpis FROM exceptions WHERE exception_id = :eid"),
+                {"eid": exception_id}
+            )
+            ex_row = ex_res.fetchone()
+
+        # Build context
+        if ex_row:
+            context = f"Exception ID: {exception_id}\nType: {ex_row._mapping['exception_type']}\nSeverity: {ex_row._mapping['severity_level']}\nRoot Cause: {ex_row._mapping['root_cause_hypotheses']}\nImpacted KPIs: {ex_row._mapping['impacted_kpis']}"
+        else:
+            context = f"Exception ID: {exception_id}\nType: Unknown\nSeverity: High. Assume a generic global supply chain disruption."
+
+        # Initialize LLM
+        llm = ChatBedrockConverse(
+            model_id="openai.gpt-oss-120b-1:0",
+            region_name="us-east-1",
+            max_tokens=2048,
+        )
+
+        prompt = f"""You are an expert supply chain optimization AI.
+Given the following context of a supply chain exception:
+{context}
+
+Generate 3 strategic and distinct mitigation alternatives. Format your response STRICTLY as a JSON array of objects with the exact keys: "id" (e.g. "alt_1"), "title" (short title up to 6 words), "description" (one full sentence describing what to do), "cost_impact" (short phrase e.g. "+$10K Extra Freight"), "kpi_impact" (short phrase on kpi change), "tradeoff" (short sentence on the risk vs reward).
+
+Return ONLY the raw JSON array. DO NOT wrap in ```json markers. Do not provide any explanation."""
+
+        ai_msg = llm.invoke([("system", "You output pure JSON arrays exclusively."), ("human", prompt)])
+        
+        # Parse the JSON response
+        if isinstance(ai_msg.content, list):
+            content_str = "".join([block.get("text", "") for block in ai_msg.content if "text" in block]).strip()
+        else:
+            content_str = str(ai_msg.content).strip()
+
+        # Clean up in case of markdown
+        if content_str.startswith("```json"): content_str = content_str[7:]
+        if content_str.startswith("```"): content_str = content_str[3:]
+        if content_str.endswith("```"): content_str = content_str[:-3]
+        content_str = content_str.strip()
+
+        alternatives = json.loads(content_str)
+
+        # Cache to DB
+        with engine.connect() as conn:
+            for alt in alternatives:
+                conn.execute(
+                    text("""INSERT INTO exception_alternatives 
+                        (exception_id, alt_id, title, description, cost_impact, kpi_impact, tradeoff) 
+                        VALUES (:eid, :aid, :title, :desc, :c_impact, :k_impact, :tradeoff)"""),
+                    {
+                        "eid": exception_id,
+                        "aid": str(alt.get("id", "alt_0")),
+                        "title": str(alt.get("title", "")),
+                        "desc": str(alt.get("description", "")),
+                        "c_impact": str(alt.get("cost_impact", "")),
+                        "k_impact": str(alt.get("kpi_impact", "")),
+                        "tradeoff": str(alt.get("tradeoff", ""))
+                    }
+                )
+            conn.commit()
+
+        return alternatives
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/approve")
 def approve_alternative(req: ApproveRequest):
-    # Simulate processing the approval
-    return {
-        "status": "approved",
-        "message": f"Alternative '{req.alternative_id}' authorized successfully.",
-        "actions_triggered": [
-            "Communicated predicted delays to affected Tier 2/3 customers.",
-            "Issued POs to LSPs (Maersk, DHL) to secure priority ISO tankers.",
-            "Updated shipping instructions with carriers.",
-            "Adjusted plant loading schedule for accelerated dispatch."
-        ]
-    }
+    try:
+        with engine.connect() as conn:
+            # Look up the alternative details
+            res = conn.execute(
+                text("SELECT title, description FROM exception_alternatives WHERE exception_id = :eid AND alt_id = :aid"),
+                {"eid": req.exception_id, "aid": req.alternative_id}
+            )
+            alt_row = res.fetchone()
+            
+            alt_title = alt_row._mapping["title"] if alt_row else "Selected Alternative"
+            alt_desc = alt_row._mapping["description"] if alt_row else ""
+            
+            # Create a task
+            task_title = f"Execute Mitigation: {alt_title}"
+            conn.execute(
+                text("""INSERT INTO tasks (exception_id, alternative_id, title, description, status) 
+                        VALUES (:eid, :aid, :title, :desc, 'Open')"""),
+                {"eid": req.exception_id, "aid": req.alternative_id, "title": task_title, "desc": alt_desc}
+            )
+            
+            # Update the exception status to 'Investigating' or 'Mitigating'
+            conn.execute(
+                text("UPDATE exceptions SET current_status = 'Mitigating' WHERE exception_id = :eid"),
+                {"eid": req.exception_id}
+            )
+            
+            conn.commit()
+            
+        return {
+            "status": "approved",
+            "message": f"Alternative '{req.alternative_id}' authorized successfully. A new task has been assigned.",
+            "actions_triggered": [
+                f"Generated workflow task: {task_title}",
+                "Notified regional operations manager via Teams.",
+                "Updated anomaly status to 'Mitigating'."
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.put("/{exception_id}/status")
+def update_exception_status(exception_id: str, req: ExceptionStatusUpdate):
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE exceptions SET current_status = :status WHERE exception_id = :eid"),
+                {"status": req.status, "eid": exception_id}
+            )
+        return {"message": "Exception status updated", "new_status": req.status}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))

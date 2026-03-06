@@ -6,7 +6,7 @@ import sys
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Configuration
 excel_file = os.path.join(BASE_DIR, 'data', 'Supply Chain_Data Dictionary_Company.xlsx')
-db_file = os.path.join(BASE_DIR, 'data', 'supply_chain.db')
+db_file = os.path.join(BASE_DIR, 'data', 'supply_chain_new.db')
 log_file = os.path.join(BASE_DIR, 'scripts', 'migration.log')
 
 def log(msg):

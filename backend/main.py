@@ -1,14 +1,18 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from ..routers import kpi_router
-from ..routers import anomaly_router
-from ..routers import ai_router
+from routers import kpi_router
+from routers import anomaly_router
+from routers import ai_router
+from routers import task_router
+from routers import calendar_router
 
 app = FastAPI(title="Supply Chain Control Tower")
 
 app.include_router(kpi_router.router)
 app.include_router(anomaly_router.router)
 app.include_router(ai_router.router)
+app.include_router(task_router.router)
+app.include_router(calendar_router.router)
 
 # Allow CORS for frontend
 origins = [
